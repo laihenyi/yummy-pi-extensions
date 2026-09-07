@@ -1,6 +1,6 @@
 {
   "name": "@sugarforever/pi-zvec-grep",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-command, continuously fresh zvec workspace search for Pi",
   "repository": {
     "type": "git",
@@ -11,12 +11,31 @@
   "bugs": "https://github.com/sugarforever/yummy-pi-extensions/issues",
   "type": "module",
   "license": "MIT",
-  "publishConfig": { "access": "public" },
-  "keywords": ["pi-package", "pi-extension", "zvec", "semantic-search"],
-  "engines": { "node": ">=22" },
-  "files": ["dist", "README.md", "LICENSE"],
-  "pi": { "extensions": ["./dist/index.js"] },
-  "exports": { ".": "./dist/index.js" },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "zvec",
+    "semantic-search"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
