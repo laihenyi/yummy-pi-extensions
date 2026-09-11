@@ -1,0 +1,56 @@
+{
+  "name": "@sugarforever/pi-throughput-meter",
+  "version": "0.1.0",
+  "description": "Per-turn TTFT and output token throughput for Pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sugarforever/yummy-pi-extensions.git",
+    "directory": "pi-throughput-meter"
+  },
+  "homepage": "https://github.com/sugarforever/yummy-pi-extensions/tree/main/pi-throughput-meter#readme",
+  "bugs": "https://github.com/sugarforever/yummy-pi-extensions/issues",
+  "type": "module",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ttft",
+    "tokens-per-second",
+    "llm-benchmark"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run test && npm run typecheck && npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^24.3.0",
+    "tsdown": "^0.15.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
