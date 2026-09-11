@@ -1,6 +1,6 @@
 {
   "name": "@sugarforever/pi-throughput-meter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Per-turn TTFT and output token throughput for Pi",
   "repository": {
     "type": "git",
