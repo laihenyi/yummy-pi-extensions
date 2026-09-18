@@ -27,9 +27,24 @@ function installExtension(engine: SearchEngine, runtimeOptions: WorkspaceRuntime
   return { handlers, tools, commands, ctx };
 }
 
-async function failIndexTimes(commands: Map<string, any>, ctx: unknown, extraFailures: number): Promise<void> {
+function lockBusyError(message = "LOCK.BUSY"): Error {
+  return Object.assign(new Error(message), { code: "LOCK.BUSY" });
+}
+
+async function drainBusyRetries(): Promise<void> {
+  await vi.runAllTimersAsync();
+}
+
+async function failIndexTimes(
+  commands: Map<string, any>,
+  ctx: unknown,
+  extraFailures: number,
+  drain?: () => Promise<void>,
+): Promise<void> {
   for (let i = 0; i < extraFailures; i += 1) {
-    await commands.get("zvec-reindex").handler("", ctx);
+    const done = commands.get("zvec-reindex").handler("", ctx);
+    if (drain) await drain();
+    await done;
   }
 }
 
@@ -272,6 +287,81 @@ describe("registerPiZvecGrep", () => {
     });
     expect(JSON.parse(result.content[0].text).retryable).toBe(false);
     await handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("three consecutive lock-busy failures stay retryable and never return the terminal payload", async () => {
+    vi.useFakeTimers();
+    const engine: SearchEngine = {
+      index: async () => { throw lockBusyError(); },
+      search: async () => ({ text: "must not search", raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine);
+    try {
+      await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+      await Promise.resolve();
+      await drainBusyRetries();
+      await failIndexTimes(commands, ctx, INDEX_FAILURE_THRESHOLD - 1, drainBusyRetries);
+
+      const result = await tools[0].execute("call-1", { query: "auth" });
+      expect(result.isError).toBe(true);
+      expect(result.details?.retryable).not.toBe(false);
+      expect(result.details?.consecutiveFailures).toBeUndefined();
+      expect(result.details?.error ?? result.content[0].text).toContain("LOCK.BUSY");
+      expect(result.content[0].text).toContain("LOCK.BUSY");
+      expect(result.content[0].text).not.toMatch(/not retryable/i);
+      expect(result.content[0].text).not.toMatch(/Rebuild the index/i);
+    } finally {
+      await handlers.get("session_shutdown")?.({}, ctx);
+      vi.useRealTimers();
+    }
+  });
+
+  test("interleaved lock-busy failures count only genuine errors toward the terminal response", async () => {
+    vi.useFakeTimers();
+    const outcomes: Array<"busy" | "real"> = ["busy", "real", "busy", "real", "real"];
+    let pass = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        if (outcomes[pass] === "busy") throw lockBusyError();
+        throw new Error("merge failed");
+      },
+      search: async () => ({ text: "must not search", raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine);
+    try {
+      await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+      await Promise.resolve();
+      await drainBusyRetries();
+      pass += 1;
+
+      await failIndexTimes(commands, ctx, 1, drainBusyRetries);
+      pass += 1;
+      await failIndexTimes(commands, ctx, 1, drainBusyRetries);
+      pass += 1;
+      await failIndexTimes(commands, ctx, 1, drainBusyRetries);
+      pass += 1;
+
+      const stillRetryable = await tools[0].execute("call-1", { query: "auth" });
+      expect(stillRetryable.details?.retryable).not.toBe(false);
+      expect(stillRetryable.details?.consecutiveFailures).toBeUndefined();
+      expect(stillRetryable.content[0].text).not.toMatch(/not retryable/i);
+
+      await failIndexTimes(commands, ctx, 1, drainBusyRetries);
+      const result = await tools[0].execute("call-2", { query: "auth" });
+      expect(result.isError).toBe(true);
+      expect(result.details).toMatchObject({
+        retryable: false,
+        error: "merge failed",
+        consecutiveFailures: INDEX_FAILURE_THRESHOLD,
+      });
+      expect(JSON.parse(result.content[0].text).retryable).toBe(false);
+      expect(JSON.parse(result.content[0].text).message).toMatch(/Rebuild the index/i);
+    } finally {
+      await handlers.get("session_shutdown")?.({}, ctx);
+      vi.useRealTimers();
+    }
   });
 
   test("zvec_search after the backoff window recovers once a later pass succeeds", async () => {

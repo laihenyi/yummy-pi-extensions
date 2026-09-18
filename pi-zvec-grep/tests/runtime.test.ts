@@ -13,6 +13,16 @@ function fakeResult(text: string): SearchResult {
   return { text, raw: { groups: [] } };
 }
 
+function lockBusyError(message = "LOCK.BUSY"): Error {
+  return Object.assign(new Error(message), { code: "LOCK.BUSY" });
+}
+
+async function settleBusyOperation(operation: Promise<unknown>): Promise<void> {
+  const settled = operation.then(() => {}, () => {});
+  await vi.runAllTimersAsync();
+  await settled;
+}
+
 describe("WorkspaceRuntime", () => {
   test("starts initial indexing without waiting for it", async () => {
     const initial = deferred<void>();
@@ -427,6 +437,142 @@ describe("WorkspaceRuntime", () => {
     expect(calls).toBe(INDEX_FAILURE_THRESHOLD + 1);
     expect(runtime.status()).toMatchObject({ phase: "ready", consecutiveFailures: 0 });
     await expect(runtime.search("query")).resolves.toEqual(fakeResult("recovered"));
+    await runtime.close();
+  });
+
+  test("three consecutive lock-busy failures leave consecutiveFailures at 0", async () => {
+    vi.useFakeTimers();
+    const engine: SearchEngine = {
+      index: async () => { throw lockBusyError(); },
+      search: async () => fakeResult("unused"),
+      close: async () => {},
+    };
+    const runtime = new WorkspaceRuntime("/repo", engine, { watch: false, debounceMs: 0 });
+    try {
+      runtime.start();
+      const initial = runtime.ready();
+      await settleBusyOperation(initial);
+      await expect(initial).rejects.toThrow("LOCK.BUSY");
+      expect(runtime.status()).toMatchObject({
+        phase: "error",
+        error: "LOCK.BUSY",
+        errorCode: "LOCK.BUSY",
+        consecutiveFailures: 0,
+      });
+
+      runtime.recordChangedPath("/repo/a.ts");
+      const second = runtime.flushChanges();
+      await settleBusyOperation(second);
+      await expect(second).rejects.toThrow("LOCK.BUSY");
+      expect(runtime.status().consecutiveFailures).toBe(0);
+
+      runtime.recordChangedPath("/repo/b.ts");
+      const third = runtime.flushChanges();
+      await settleBusyOperation(third);
+      await expect(third).rejects.toThrow("LOCK.BUSY");
+      expect(runtime.status()).toMatchObject({
+        phase: "error",
+        error: "LOCK.BUSY",
+        errorCode: "LOCK.BUSY",
+        consecutiveFailures: 0,
+      });
+    } finally {
+      await runtime.close();
+      vi.useRealTimers();
+    }
+  });
+
+  test("interleaved lock-busy failures count only genuine errors toward the threshold", async () => {
+    vi.useFakeTimers();
+    const outcomes: Array<"busy" | "real"> = ["busy", "real", "busy", "real", "busy", "real"];
+    let pass = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        if (outcomes[pass] === "busy") throw lockBusyError();
+        throw Object.assign(new Error("merge failed"), { code: "FTS_CORRUPT" });
+      },
+      search: async () => fakeResult("unused"),
+      close: async () => {},
+    };
+    const runtime = new WorkspaceRuntime("/repo", engine, { watch: false, debounceMs: 0 });
+    try {
+      runtime.start();
+      const initial = runtime.ready();
+      await settleBusyOperation(initial);
+      await expect(initial).rejects.toThrow("LOCK.BUSY");
+      pass += 1;
+      expect(runtime.status()).toMatchObject({ phase: "error", consecutiveFailures: 0, error: "LOCK.BUSY" });
+
+      runtime.recordChangedPath("/repo/a.ts");
+      const second = runtime.flushChanges();
+      await settleBusyOperation(second);
+      await expect(second).rejects.toThrow("merge failed");
+      pass += 1;
+      expect(runtime.status()).toMatchObject({
+        phase: "error",
+        consecutiveFailures: 1,
+        error: "merge failed",
+        errorCode: "FTS_CORRUPT",
+      });
+
+      runtime.recordChangedPath("/repo/b.ts");
+      const third = runtime.flushChanges();
+      await settleBusyOperation(third);
+      await expect(third).rejects.toThrow("LOCK.BUSY");
+      pass += 1;
+      expect(runtime.status().consecutiveFailures).toBe(1);
+
+      runtime.recordChangedPath("/repo/c.ts");
+      const fourth = runtime.flushChanges();
+      await settleBusyOperation(fourth);
+      await expect(fourth).rejects.toThrow("merge failed");
+      pass += 1;
+      expect(runtime.status().consecutiveFailures).toBe(2);
+
+      runtime.recordChangedPath("/repo/d.ts");
+      const fifth = runtime.flushChanges();
+      await settleBusyOperation(fifth);
+      await expect(fifth).rejects.toThrow("LOCK.BUSY");
+      pass += 1;
+      expect(runtime.status().consecutiveFailures).toBe(2);
+
+      runtime.recordChangedPath("/repo/e.ts");
+      const sixth = runtime.flushChanges();
+      await settleBusyOperation(sixth);
+      await expect(sixth).rejects.toThrow("merge failed");
+      expect(runtime.status()).toMatchObject({
+        phase: "error",
+        error: "merge failed",
+        errorCode: "FTS_CORRUPT",
+        consecutiveFailures: INDEX_FAILURE_THRESHOLD,
+      });
+    } finally {
+      await runtime.close();
+      vi.useRealTimers();
+    }
+  });
+
+  test("three genuine index failures still trip the terminal failure state", async () => {
+    const engine: SearchEngine = {
+      index: async () => {
+        throw Object.assign(new Error("merge failed"), { code: "FTS_CORRUPT" });
+      },
+      search: async () => fakeResult("unused"),
+      close: async () => {},
+    };
+    const runtime = new WorkspaceRuntime("/repo", engine, { watch: false, debounceMs: 0 });
+    runtime.start();
+    await expect(runtime.ready()).rejects.toThrow("merge failed");
+    runtime.recordChangedPath("/repo/a.ts");
+    await expect(runtime.flushChanges()).rejects.toThrow("merge failed");
+    runtime.recordChangedPath("/repo/b.ts");
+    await expect(runtime.flushChanges()).rejects.toThrow("merge failed");
+    expect(runtime.status()).toMatchObject({
+      phase: "error",
+      error: "merge failed",
+      errorCode: "FTS_CORRUPT",
+      consecutiveFailures: INDEX_FAILURE_THRESHOLD,
+    });
     await runtime.close();
   });
 

@@ -197,9 +197,11 @@ export class WorkspaceRuntime {
     const { message, code } = describeError(cause);
     this.error = message;
     this.errorCode = code;
-    this.consecutiveFailures += 1;
-    if (this.consecutiveFailures >= INDEX_FAILURE_THRESHOLD) {
-      this.backoffUntil = Date.now() + this.failureBackoffMs;
+    if (!isBusyError(cause)) {
+      this.consecutiveFailures += 1;
+      if (this.consecutiveFailures >= INDEX_FAILURE_THRESHOLD) {
+        this.backoffUntil = Date.now() + this.failureBackoffMs;
+      }
     }
     this.phase = "error";
     this.emitStatus();
