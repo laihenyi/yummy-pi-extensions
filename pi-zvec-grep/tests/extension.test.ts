@@ -1,11 +1,36 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { registerPiZvecGrep } from "../src/extension.js";
+import { INDEX_FAILURE_THRESHOLD, type WorkspaceRuntimeOptions } from "../src/runtime.js";
 import type { SearchEngine } from "../src/types.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => { resolve = res; });
   return { promise, resolve };
+}
+
+function installExtension(engine: SearchEngine, runtimeOptions: WorkspaceRuntimeOptions = {}) {
+  const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+  const tools: any[] = [];
+  const commands = new Map<string, any>();
+  const pi = {
+    on: (name: string, handler: any) => handlers.set(name, handler),
+    registerTool: (tool: any) => tools.push(tool),
+    registerCommand: (name: string, command: any) => commands.set(name, command),
+  };
+  registerPiZvecGrep(pi as never, {
+    createEngine: async () => engine,
+    resolveRoot: async () => "/repo",
+    runtimeOptions: { watch: false, ...runtimeOptions },
+  });
+  const ctx = { cwd: "/repo", hasUI: false, ui: { setStatus: () => {}, notify: () => {} } };
+  return { handlers, tools, commands, ctx };
+}
+
+async function failIndexTimes(commands: Map<string, any>, ctx: unknown, extraFailures: number): Promise<void> {
+  for (let i = 0; i < extraFailures; i += 1) {
+    await commands.get("zvec-reindex").handler("", ctx);
+  }
 }
 
 describe("registerPiZvecGrep", () => {
@@ -21,6 +46,7 @@ describe("registerPiZvecGrep", () => {
     expect(result).toMatchObject({ systemPrompt: expect.stringContaining("zvec_search") });
     expect((result as any).systemPrompt).toContain("exact identifiers");
     expect((result as any).systemPrompt).toContain("grep");
+    expect((result as any).systemPrompt).toContain("retryable");
   });
 
   test("registers search immediately and manages runtime through session lifecycle", async () => {
@@ -148,5 +174,144 @@ describe("registerPiZvecGrep", () => {
     await reconcile;
     expect(statuses.at(-1)).toContain("ready");
     await handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("a single index failure during a later pass stays retryable", async () => {
+    const second = deferred<void>();
+    let calls = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("transient merge glitch");
+        await second.promise;
+      },
+      search: async () => ({ text: "must not search", raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine);
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const failed = await tools[0].execute("call-1", { query: "auth" });
+    expect(failed.isError).toBe(true);
+    expect(failed.details?.retryable).not.toBe(false);
+
+    const reconcile = commands.get("zvec-reindex").handler("", ctx);
+    await Promise.resolve();
+    const pending = await tools[0].execute("call-2", { query: "auth" });
+    expect(pending).toMatchObject({
+      details: { status: "updating", retryable: true, root: "/repo", error: "transient merge glitch" },
+    });
+    expect(pending.isError).toBeUndefined();
+
+    second.resolve();
+    await reconcile;
+    await handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("zvec_search is terminal after consecutive failures even while a later pass is running", async () => {
+    const fourth = deferred<void>();
+    let calls = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        calls += 1;
+        if (calls <= INDEX_FAILURE_THRESHOLD) {
+          throw Object.assign(new Error("FtsRocksdbReducer: source postings is not BitPacked. field=text"), { code: "FTS_CORRUPT" });
+        }
+        await fourth.promise;
+      },
+      search: async () => ({ text: "must not search", raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine);
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await failIndexTimes(commands, ctx, INDEX_FAILURE_THRESHOLD - 1);
+    expect(calls).toBe(INDEX_FAILURE_THRESHOLD);
+
+    const reconcile = commands.get("zvec-reindex").handler("", ctx);
+    await Promise.resolve();
+    const result = await tools[0].execute("call-1", { query: "auth" });
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      retryable: false,
+      root: "/repo",
+      error: "FtsRocksdbReducer: source postings is not BitPacked. field=text",
+      errorCode: "FTS_CORRUPT",
+    });
+    expect(result.details.consecutiveFailures).toBeGreaterThanOrEqual(INDEX_FAILURE_THRESHOLD);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.retryable).toBe(false);
+    expect(payload.message).toContain("BitPacked");
+    expect(payload.message.toLowerCase()).toMatch(/rebuild/);
+
+    fourth.resolve();
+    await reconcile;
+    await handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("zvec_search is terminal after consecutive failures when no pass is running", async () => {
+    const engine: SearchEngine = {
+      index: async () => {
+        throw new Error("FtsRocksdbReducer: source postings is not BitPacked. field=text");
+      },
+      search: async () => ({ text: "must not search", raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine);
+    await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await failIndexTimes(commands, ctx, INDEX_FAILURE_THRESHOLD - 1);
+
+    const result = await tools[0].execute("call-1", { query: "auth" });
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({
+      retryable: false,
+      root: "/repo",
+      error: "FtsRocksdbReducer: source postings is not BitPacked. field=text",
+    });
+    expect(JSON.parse(result.content[0].text).retryable).toBe(false);
+    await handlers.get("session_shutdown")?.({}, ctx);
+  });
+
+  test("zvec_search after the backoff window recovers once a later pass succeeds", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    let calls = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        calls += 1;
+        if (calls <= INDEX_FAILURE_THRESHOLD) throw new Error("merge failed");
+      },
+      search: async (query) => ({ text: `result:${query}`, raw: {} }),
+      close: async () => {},
+    };
+    const { handlers, tools, commands, ctx } = installExtension(engine, { indexFailureBackoffMs: 5_000 });
+    try {
+      await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+      await Promise.resolve();
+      await Promise.resolve();
+      await failIndexTimes(commands, ctx, INDEX_FAILURE_THRESHOLD - 1);
+      expect(calls).toBe(INDEX_FAILURE_THRESHOLD);
+
+      const blocked = await tools[0].execute("call-1", { query: "auth" });
+      expect(blocked.isError).toBe(true);
+      expect(blocked.details.retryable).toBe(false);
+      expect(calls).toBe(INDEX_FAILURE_THRESHOLD);
+
+      vi.setSystemTime(new Date("2026-01-01T00:00:05Z"));
+      const retry = await tools[0].execute("call-2", { query: "auth" });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(INDEX_FAILURE_THRESHOLD + 1);
+      const recovered = retry.content[0].text === "result:auth"
+        ? retry
+        : await tools[0].execute("call-3", { query: "auth" });
+      expect(recovered.content).toEqual([{ type: "text", text: "result:auth" }]);
+      expect(recovered.isError).toBeUndefined();
+    } finally {
+      await handlers.get("session_shutdown")?.({}, ctx);
+      vi.useRealTimers();
+    }
   });
 });
