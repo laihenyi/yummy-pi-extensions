@@ -20,6 +20,7 @@ export class WorkspaceRuntime {
   private errorCode?: string;
   private consecutiveFailures = 0;
   private backoffUntil = 0;
+  private recoveryPending = false;
   private lastIndexedAt?: string;
   private initial?: Promise<void>;
   private queue: Promise<void> = Promise.resolve();
@@ -114,9 +115,13 @@ export class WorkspaceRuntime {
   retryIndexingAfterBackoff(): void {
     if (this.closed) return;
     if (this.consecutiveFailures < INDEX_FAILURE_THRESHOLD) return;
+    if (this.recoveryPending) return;
     if (this.phase === "indexing" || this.phase === "updating") return;
     if (Date.now() < this.backoffUntil) return;
-    this.runBackground(this.enqueueIndex());
+    this.recoveryPending = true;
+    this.runBackground(this.enqueueIndex().finally(() => {
+      this.recoveryPending = false;
+    }));
   }
 
   status(): RuntimeStatus {

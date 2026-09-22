@@ -367,6 +367,45 @@ describe("WorkspaceRuntime", () => {
     }
   });
 
+  test("deduplicates concurrent recovery requests after backoff elapses", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    let calls = 0;
+    const engine: SearchEngine = {
+      index: async () => {
+        calls += 1;
+        throw new Error("merge failed");
+      },
+      search: async () => fakeResult("unused"),
+      close: async () => {},
+    };
+    const runtime = new WorkspaceRuntime("/repo", engine, {
+      watch: false,
+      debounceMs: 0,
+      indexFailureBackoffMs: 5_000,
+    });
+    try {
+      runtime.start();
+      await expect(runtime.ready()).rejects.toThrow("merge failed");
+      runtime.recordChangedPath("/repo/a.ts");
+      await expect(runtime.flushChanges()).rejects.toThrow("merge failed");
+      runtime.recordChangedPath("/repo/b.ts");
+      await expect(runtime.flushChanges()).rejects.toThrow("merge failed");
+      expect(calls).toBe(INDEX_FAILURE_THRESHOLD);
+
+      vi.setSystemTime(new Date("2026-01-01T00:00:05Z"));
+      runtime.retryIndexingAfterBackoff();
+      runtime.retryIndexingAfterBackoff();
+      runtime.retryIndexingAfterBackoff();
+      await runtime.flushChanges();
+
+      expect(calls).toBe(INDEX_FAILURE_THRESHOLD + 1);
+    } finally {
+      await runtime.close();
+      vi.useRealTimers();
+    }
+  });
+
   test("a successful watcher-triggered pass after backoff resets failure state", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
